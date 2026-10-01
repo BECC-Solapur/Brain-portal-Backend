@@ -1,0 +1,31 @@
+import { Router } from 'express';
+import { authRoutes } from './auth.routes';
+import { publicRoutes } from './public.routes';
+import { inquiryRoutes } from './inquiries.routes';
+import { paymentRoutes } from './payments.routes';
+import { appointmentRoutes } from './appointments.routes';
+import { referralRoutes } from './referrals.routes';
+import { adminRoutes } from './admin.routes';
+import { studentRoutes } from './students.routes';
+import { studentPortalRoutes } from './student-portal.routes';
+import { conclusionRoutes } from './conclusions.routes';
+import { followupRoutes } from './followups.routes';
+import { assessmentRoutes } from './assessments.routes';
+import { settingsRoutes } from './settings.routes';
+
+export const routes = Router();
+
+routes.use('/auth', authRoutes);
+routes.use('/public', publicRoutes);
+routes.use('/inquiries', inquiryRoutes);
+routes.use('/payments', paymentRoutes);
+routes.use('/appointments', appointmentRoutes);
+routes.use('/counsellors', appointmentRoutes);
+routes.use('/referrals', referralRoutes);
+routes.use('/admin', adminRoutes);
+routes.use('/students', studentRoutes);
+routes.use('/student-portal', studentPortalRoutes);
+routes.use('/conclusions', conclusionRoutes);
+routes.use('/followups', followupRoutes);
+routes.use('/assessments', assessmentRoutes);
+routes.use('/settings', settingsRoutes);
