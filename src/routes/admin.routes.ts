@@ -4,6 +4,7 @@ import { requireAuth, requireRoles } from '../middleware/auth';
 import { asyncHandler, success, ApiError } from '../types/api';
 import { query } from '../config/db';
 import { hashPassword } from '../utils/auth';
+import { z } from 'zod';
 
 adminRoutes.use(requireAuth(), requireRoles('superadmin', 'brain_admin'));
 
@@ -189,10 +190,16 @@ adminRoutes.get('/users', asyncHandler(async (req, res) => {
 
 adminRoutes.post('/users', asyncHandler(async (req, res) => {
   const orgId = req.auth!.orgId;
-  const { name, email, role } = req.body;
-  if (!name || !email || !role) {
-    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Name, email and role are required');
+  const parsed = z.object({
+    name: z.string().trim().min(1),
+    email: z.string().trim().email(),
+    role: z.enum(['Admin', 'Brain Admin', 'SuperAdmin', 'Counsellor', 'Student', 'Parent']),
+    password: z.string().min(8).max(72).optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Provide a name, valid email, supported role and password of 8–72 characters');
   }
+  const { name, email, role, password } = parsed.data;
 
   const { rows: existing } = await query<any>(
     "SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL",
@@ -212,7 +219,21 @@ adminRoutes.post('/users', asyncHandler(async (req, res) => {
   };
   const targetRoleCode = roleCodeMap[role] || role.toLowerCase();
 
-  const pwHash = await hashPassword('Brain@1234');
+  if (['brain_admin', 'superadmin'].includes(targetRoleCode) && !req.auth!.roles.includes('superadmin')) {
+    throw new ApiError('AUTH_ROLE_INSUFFICIENT', 'Only SuperAdmin can create administrator credentials', 403);
+  }
+  if (targetRoleCode === 'brain_admin' && !password) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'A password is required for Brain Admin credentials');
+  }
+  const { rows: roleRows } = await query<any>(
+    "SELECT id, name FROM roles WHERE code = $1 OR LOWER(code) = LOWER($1) LIMIT 1",
+    [targetRoleCode]
+  );
+  if (!roleRows.length) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'The requested role is not configured');
+  }
+
+  const pwHash = await hashPassword(password || 'Brain@1234');
 
   const { rows: [newUser] } = await query<any>(`
     INSERT INTO users (organization_id, email, full_name, display_name, password_hash, status, is_active)
@@ -220,10 +241,6 @@ adminRoutes.post('/users', asyncHandler(async (req, res) => {
     RETURNING id, full_name AS name, email, created_at AS "createdAt"
   `, [orgId, email.trim(), name.trim(), pwHash]);
 
-  const { rows: roleRows } = await query<any>(
-    "SELECT id, name FROM roles WHERE code = $1 OR LOWER(code) = LOWER($1) LIMIT 1",
-    [targetRoleCode]
-  );
   if (roleRows.length > 0) {
     await query(`
       INSERT INTO user_roles (user_id, role_id)
