@@ -115,13 +115,19 @@ adminRoutes.get('/stats', asyncHandler(async (req, res) => {
     SELECT
       (SELECT COUNT(*)::int FROM students WHERE organization_id = $1 AND deleted_at IS NULL) AS registered_students,
       (SELECT COUNT(*)::int FROM students WHERE organization_id = $1 AND created_at >= NOW() - INTERVAL '7 days' AND deleted_at IS NULL) AS delta7d,
-      (SELECT COUNT(*)::int FROM follow_up_records WHERE organization_id = $1 AND status='pending' AND scheduled_date <= CURRENT_DATE) AS followups_due,
-      (SELECT COUNT(*)::int FROM follow_up_records WHERE organization_id = $1 AND status='pending' AND scheduled_date < CURRENT_DATE) AS followups_overdue,
-      (SELECT COALESCE(SUM(amount_numeric), 0)::numeric FROM payments WHERE organization_id = $1 AND status='paid') AS fees_collected,
+      (SELECT COUNT(*)::int FROM follow_up_records followup
+        JOIN inquiries inquiry ON inquiry.id=followup.inquiry_id
+        WHERE inquiry.organization_id=$1 AND followup.status='pending'
+          AND followup.scheduled_date <= CURRENT_DATE) AS followups_due,
+      (SELECT COUNT(*)::int FROM follow_up_records followup
+        JOIN inquiries inquiry ON inquiry.id=followup.inquiry_id
+        WHERE inquiry.organization_id=$1 AND followup.status='pending'
+          AND followup.scheduled_date < CURRENT_DATE) AS followups_overdue,
+      (SELECT COALESCE(SUM(total_amount), 0)::numeric FROM payments WHERE organization_id = $1 AND status='paid') AS fees_collected,
       (SELECT COUNT(*)::int FROM counselling_sessions cs
         JOIN appointments a ON a.id = cs.appointment_id
         WHERE a.organization_id = $1 AND cs.status='completed'
-          AND cs.ended_at >= NOW() - INTERVAL '7 days') AS sessions_completed_week,
+          AND cs.session_ended_at >= NOW() - INTERVAL '7 days') AS sessions_completed_week,
       (SELECT COUNT(*)::int FROM counselling_sessions cs
         JOIN appointments a ON a.id = cs.appointment_id
         WHERE a.organization_id = $1 AND a.appointment_date = CURRENT_DATE
@@ -139,7 +145,7 @@ adminRoutes.get('/stats', asyncHandler(async (req, res) => {
           AND paid_at >= DATE_TRUNC('month', CURRENT_DATE)) AS referral_conversions_month,
       (SELECT COALESCE(SUM(discount_amount_applied), 0)::numeric FROM payments
         WHERE organization_id = $1 AND status='paid') AS referral_discount_total,
-      (SELECT COALESCE(SUM(amount_numeric), 0)::numeric FROM payments
+      (SELECT COALESCE(SUM(total_amount), 0)::numeric FROM payments
         WHERE organization_id = $1 AND status='paid'
           AND referral_code_id IS NOT NULL) AS referral_revenue_total
   `, [orgId]);
