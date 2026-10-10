@@ -72,24 +72,43 @@ followupRoutes.get('/', requireAuth(), asyncHandler(async (req, res) => {
 
   const { rows } = await query<any>(sql, params);
 
+  const { rows: appointmentReminders } = await query<any>(`
+    SELECT a.id, a.inquiry_id, a.appointment_date, a.slot_time_display,
+      i.inquiry_number, i.status AS inquiry_status,
+      s.full_name AS student_name, s.email AS student_email, s.phone AS student_phone,
+      p.name AS program_name, c.full_name AS counsellor_name
+    FROM appointments a
+    JOIN inquiries i ON i.id=a.inquiry_id
+    JOIN students s ON s.id=i.student_id
+    LEFT JOIN programs p ON p.id=i.program_id
+    LEFT JOIN counsellors c ON c.id=a.counsellor_id
+    WHERE a.organization_id=$1
+      AND a.appointment_date >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+      AND a.appointment_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::date + 7
+      AND a.status NOT IN ('cancelled', 'completed')
+    ORDER BY a.appointment_date, a.slot_start_time
+  `, [auth.orgId]);
+
   // Compute stats
   const { rows: [stats] } = await query<any>(`
     SELECT
-      COUNT(*) FILTER (WHERE f.followup_date = CURRENT_DATE AND (f.status_code IS NULL OR f.status_code = 'pending'))::int AS due_today,
-      COUNT(*) FILTER (WHERE f.followup_date < CURRENT_DATE AND (f.status_code IS NULL OR f.status_code = 'pending'))::int AS overdue,
+      COUNT(*) FILTER (WHERE f.followup_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date AND COALESCE(f.status_code, 'pending') IN ('pending', 'scheduled'))::int AS due_today,
+      COUNT(*) FILTER (WHERE f.followup_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::date AND COALESCE(f.status_code, 'pending') IN ('pending', 'scheduled'))::int AS overdue,
       COUNT(*) FILTER (WHERE f.status_code = 'completed' AND f.updated_at >= NOW() - INTERVAL '7 days')::int AS completed_this_week,
-      COUNT(*) FILTER (WHERE (f.status_code IS NULL OR f.status_code = 'pending') AND f.followup_date >= CURRENT_DATE AND f.followup_date < CURRENT_DATE + 7)::int AS due_this_week,
-      COUNT(*) FILTER (WHERE f.status_code IS NULL OR f.status_code = 'pending')::int AS total_pending,
+      COUNT(*) FILTER (WHERE COALESCE(f.status_code, 'pending') IN ('pending', 'scheduled') AND f.followup_date >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date AND f.followup_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::date + 7)::int AS due_this_week,
+      COUNT(*) FILTER (WHERE COALESCE(f.status_code, 'pending') IN ('pending', 'scheduled'))::int AS total_pending,
       (SELECT COUNT(*)::int FROM appointments a
        JOIN inquiries ai ON ai.id = a.inquiry_id
        WHERE ai.organization_id = $1 AND a.appointment_date = CURRENT_DATE + 1
          AND a.status NOT IN ('cancelled', 'completed')) AS tomorrow_sessions
     FROM follow_up_records f
-    WHERE f.organization_id = $1
+    JOIN inquiries fi ON fi.id=f.inquiry_id
+    WHERE fi.organization_id = $1 AND fi.deleted_at IS NULL
   `, [auth.orgId]);
 
   const followups = rows.map(r => ({
     id: r.id,
+    sourceType: 'followup',
     inquiryId: r.inquiry_id,
     inquiryNumber: r.inquiry_number,
     inquiryStatus: r.inquiry_status,
@@ -106,12 +125,31 @@ followupRoutes.get('/', requireAuth(), asyncHandler(async (req, res) => {
     createdAt: r.created_at,
   }));
 
+  followups.push(...appointmentReminders.map(r => ({
+    id: `appointment:${r.id}`,
+    sourceType: 'appointment',
+    inquiryId: r.inquiry_id,
+    inquiryNumber: r.inquiry_number,
+    inquiryStatus: r.inquiry_status,
+    studentName: r.student_name,
+    studentEmail: r.student_email,
+    studentPhone: r.student_phone,
+    programName: r.program_name,
+    followupDate: r.appointment_date,
+    remark: `Counselling session reminder${r.slot_time_display ? ` · ${r.slot_time_display}` : ''}`,
+    statusCode: 'scheduled',
+    conductedBy: r.counsellor_name || 'Counsellor',
+    nextFollowupDate: null,
+    isOverdue: false,
+    createdAt: r.appointment_date,
+  })));
+
   res.json(success({
     followups,
     stats: {
       totalDueToday: (stats?.due_today || 0) + (stats?.tomorrow_sessions || 0),
       tomorrowCounsellingReminders: stats?.tomorrow_sessions || 0,
-      weeklyFollowUps: stats?.due_this_week || 0,
+      weeklyFollowUps: (stats?.due_this_week || 0) + appointmentReminders.length,
       overdue: stats?.overdue || 0,
       completedThisWeek: stats?.completed_this_week || 0,
       pendingFollowUps: stats?.total_pending || 0,

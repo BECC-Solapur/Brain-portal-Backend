@@ -23,16 +23,12 @@ interface ProgramPublic {
 publicRoutes.get('/programs', asyncHandler(async (_req, res) => {
   const { rows } = await query<any>(`
     SELECT p.id, p.code, p.name, p.tagline, p.grade_range, p.description,
-           p.price, p.gradient_classes, p.icon_name, p.is_active
+           p.price, ''::text AS gradient_classes, p.icon_name, p.is_active
     FROM programs p
     WHERE p.is_active = TRUE
     ORDER BY p.sort_order
   `);
-  const programs: ProgramPublic[] = await Promise.all(rows.map(async (r) => {
-    const { rows: fr } = await query<any>(
-      `SELECT feature_text FROM program_features WHERE program_id = $1 ORDER BY sort_order`,
-      [r.id]
-    );
+  const programs: ProgramPublic[] = rows.map((r) => {
     return {
       id: r.id,
       code: r.code,
@@ -40,14 +36,14 @@ publicRoutes.get('/programs', asyncHandler(async (_req, res) => {
       tagline: r.tagline,
       gradeRange: r.grade_range,
       description: r.description,
-      features: fr.map((f: any) => f.feature_text),
+      features: [],
       price: parseFloat(r.price),
       currency: 'INR' as 'INR',
       gradientCssClasses: r.gradient_classes || '',
       iconName: r.icon_name || '',
       isActive: r.is_active,
     };
-  }));
+  });
   res.json(success(programs));
 }));
 

@@ -2,9 +2,10 @@ import { Router } from 'express';
 export const adminRoutes = Router();
 import { requireAuth, requireRoles } from '../middleware/auth';
 import { asyncHandler, success, ApiError } from '../types/api';
-import { query } from '../config/db';
+import { query, tx } from '../config/db';
 import { hashPassword } from '../utils/auth';
 import { z } from 'zod';
+import { validate } from '../middleware/validate';
 
 adminRoutes.use(requireAuth(), requireRoles('superadmin', 'brain_admin'));
 
@@ -41,7 +42,7 @@ adminRoutes.get('/brain-overview', requireRoles('brain_admin'), asyncHandler(asy
     FROM programs p
     LEFT JOIN inquiries i ON i.program_id=p.id AND i.organization_id=$1 AND i.deleted_at IS NULL
     LEFT JOIN students s ON s.id=i.student_id AND s.deleted_at IS NULL AND s.is_active=TRUE
-    WHERE p.organization_id=$1 AND p.is_active=TRUE
+    WHERE p.organization_id=$1 AND p.is_active=TRUE AND LOWER(p.code) <> 'cmt'
     GROUP BY p.id, p.name, p.sort_order
     ORDER BY p.sort_order, p.name
   `, [orgId]);
@@ -55,7 +56,24 @@ adminRoutes.get('/brain-overview', requireRoles('brain_admin'), asyncHandler(asy
     )
     SELECT COUNT(*)::int AS count FROM dates d
     JOIN counsellors c ON c.organization_id=$1 AND c.is_active=TRUE AND c.deleted_at IS NULL
-    JOIN time_slots ts ON ts.is_active=TRUE AND (ts.branch_id=c.branch_id OR ts.branch_id IS NULL)
+    CROSS JOIN LATERAL (
+      SELECT configured.slot_start_time, configured.is_weekday_available
+      FROM time_slots configured
+      WHERE configured.is_active=TRUE
+        AND (configured.branch_id=c.branch_id OR configured.branch_id IS NULL)
+      UNION ALL
+      SELECT defaults.slot_start_time,
+        ARRAY[TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE]::boolean[]
+      FROM (VALUES
+        ('09:00:00'::time), ('11:00:00'::time), ('14:00:00'::time),
+        ('16:00:00'::time), ('17:00:00'::time)
+      ) defaults(slot_start_time)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM time_slots configured
+        WHERE configured.is_active=TRUE
+          AND (configured.branch_id=c.branch_id OR configured.branch_id IS NULL)
+      )
+    ) ts
     WHERE COALESCE(ts.is_weekday_available[EXTRACT(ISODOW FROM d.day)::int], FALSE)
       AND (d.day > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
         OR ts.slot_start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
@@ -66,13 +84,86 @@ adminRoutes.get('/brain-overview', requireRoles('brain_admin'), asyncHandler(asy
       )
   `, [orgId]);
   const { rows: [followups] } = await query<any>(`
-    SELECT COUNT(DISTINCT inquiry_id)::int AS count FROM follow_up_records
-    WHERE next_followup_date >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date
-      AND next_followup_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::date + 7
-      AND inquiry_id IN (SELECT id FROM inquiries WHERE organization_id=$1 AND deleted_at IS NULL)
+    WITH reminder_inquiries AS (
+      SELECT f.inquiry_id
+      FROM follow_up_records f
+      JOIN inquiries i ON i.id=f.inquiry_id
+      WHERE i.organization_id=$1 AND i.deleted_at IS NULL
+        AND COALESCE(f.status_code, 'pending') IN ('pending', 'scheduled')
+        AND COALESCE(f.next_followup_date, f.followup_date) >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+        AND COALESCE(f.next_followup_date, f.followup_date) < (NOW() AT TIME ZONE 'Asia/Kolkata')::date + 7
+      UNION
+      SELECT a.inquiry_id
+      FROM appointments a
+      WHERE a.organization_id=$1
+        AND a.appointment_date >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+        AND a.appointment_date < (NOW() AT TIME ZONE 'Asia/Kolkata')::date + 7
+        AND a.status NOT IN ('cancelled', 'completed')
+    )
+    SELECT COUNT(*)::int AS count FROM reminder_inquiries
   `, [orgId]);
   res.json(success({ registeredStudents: totals.registeredStudents, availableSlots: slots.count,
     upcomingFollowups: followups.count, modules }));
+}));
+
+adminRoutes.get('/pricing', requireRoles('brain_admin'), asyncHandler(async (req, res) => {
+  const { rows } = await query<any>(`
+    SELECT id, code, name, price, gst_rate_percent, service_fee_rate_percent, is_active, sort_order
+    FROM programs
+    WHERE organization_id=$1 AND is_active=TRUE
+    ORDER BY CASE WHEN LOWER(code)='cmt' THEN 1 ELSE 0 END, sort_order, name
+  `, [req.auth!.orgId]);
+
+  res.json(success(rows.map((row) => ({
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    kind: String(row.code).toLowerCase() === 'cmt' ? 'ai_cmt' : 'module',
+    price: Number(row.price),
+    gstRatePercent: Number(row.gst_rate_percent || 0),
+    serviceFeeRatePercent: Number(row.service_fee_rate_percent || 0),
+    totalWithGst: Math.round(Number(row.price) * (1 + Number(row.gst_rate_percent || 0) / 100)),
+  }))));
+}));
+
+const UpdatePricingSchema = z.object({
+  items: z.array(z.object({
+    id: z.string().uuid(),
+    price: z.number().finite().min(0).max(1000000),
+  })).min(1).max(20),
+});
+
+adminRoutes.patch('/pricing', requireRoles('brain_admin'), validate(UpdatePricingSchema), asyncHandler(async (req, res) => {
+  const items = req.body.items as Array<{ id: string; price: number }>;
+  if (new Set(items.map((item) => item.id)).size !== items.length) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Each pricing item can only be submitted once.');
+  }
+
+  const updated = await tx(async (client) => {
+    const rows: any[] = [];
+    for (const item of items) {
+      const { rows: [row] } = await client.query<any>(`
+        UPDATE programs
+        SET price=$1, updated_by=$2, updated_at=NOW()
+        WHERE id=$3 AND organization_id=$4 AND is_active=TRUE
+        RETURNING id, code, name, price, gst_rate_percent, service_fee_rate_percent
+      `, [item.price, req.auth!.userId, item.id, req.auth!.orgId]);
+      if (!row) throw ApiError.notFound('One of the pricing items was not found.');
+      rows.push(row);
+    }
+    return rows;
+  });
+
+  res.json(success(updated.map((row) => ({
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    kind: String(row.code).toLowerCase() === 'cmt' ? 'ai_cmt' : 'module',
+    price: Number(row.price),
+    gstRatePercent: Number(row.gst_rate_percent || 0),
+    serviceFeeRatePercent: Number(row.service_fee_rate_percent || 0),
+    totalWithGst: Math.round(Number(row.price) * (1 + Number(row.gst_rate_percent || 0) / 100)),
+  }))));
 }));
 
 adminRoutes.get('/registered-students', requireRoles('brain_admin'), asyncHandler(async (req, res) => {
@@ -117,12 +208,14 @@ adminRoutes.get('/stats', asyncHandler(async (req, res) => {
       (SELECT COUNT(*)::int FROM students WHERE organization_id = $1 AND created_at >= NOW() - INTERVAL '7 days' AND deleted_at IS NULL) AS delta7d,
       (SELECT COUNT(*)::int FROM follow_up_records followup
         JOIN inquiries inquiry ON inquiry.id=followup.inquiry_id
-        WHERE inquiry.organization_id=$1 AND followup.status='pending'
-          AND followup.scheduled_date <= CURRENT_DATE) AS followups_due,
+        WHERE inquiry.organization_id=$1
+          AND (followup.status_code IS NULL OR followup.status_code='pending')
+          AND followup.followup_date <= CURRENT_DATE) AS followups_due,
       (SELECT COUNT(*)::int FROM follow_up_records followup
         JOIN inquiries inquiry ON inquiry.id=followup.inquiry_id
-        WHERE inquiry.organization_id=$1 AND followup.status='pending'
-          AND followup.scheduled_date < CURRENT_DATE) AS followups_overdue,
+        WHERE inquiry.organization_id=$1
+          AND (followup.status_code IS NULL OR followup.status_code='pending')
+          AND followup.followup_date < CURRENT_DATE) AS followups_overdue,
       (SELECT COALESCE(SUM(total_amount), 0)::numeric FROM payments WHERE organization_id = $1 AND status='paid') AS fees_collected,
       (SELECT COUNT(*)::int FROM counselling_sessions cs
         JOIN appointments a ON a.id = cs.appointment_id
@@ -357,27 +450,82 @@ adminRoutes.get('/audit-logs', asyncHandler(async (req, res) => {
   }
 
   const { rows } = await query<any>(`
-    SELECT al.id,
-           TO_CHAR(al.created_at, 'HH24:MI') AS time,
-           TO_CHAR(al.created_at, 'DD Mon YYYY') AS date,
-           COALESCE(u.full_name, 'System Administrator') AS actor,
-           COALESCE(al.actor_role_code, 'Admin') AS role,
-           al.action_description AS action,
-           COALESCE(al.action_module, al.entity_type, 'System') AS reference,
-           al.created_at
-    FROM audit_logs al
-    LEFT JOIN users u ON u.id = al.actor_user_id
-    WHERE al.organization_id = $1 OR al.organization_id IS NULL
-    ORDER BY al.created_at DESC
+    WITH activity AS (
+      SELECT al.id::text AS id, al.created_at,
+        COALESCE(u.full_name, 'System Administrator') AS actor,
+        COALESCE(al.actor_role_code, 'admin') AS role,
+        al.action_description AS action,
+        COALESCE(al.action_module, al.entity_type, 'System') AS reference
+      FROM audit_logs al
+      LEFT JOIN users u ON u.id = al.actor_user_id
+      WHERE al.organization_id = $1 OR al.organization_id IS NULL
+
+      UNION ALL
+
+      SELECT d.id::text, d.submitted_at, s.full_name, 'student',
+        'Submitted daily wellness check-in', 'WELLNESS'
+      FROM daily_check_ins d
+      JOIN students s ON s.id = d.student_id
+      WHERE d.organization_id = $1
+
+      UNION ALL
+
+      SELECT pf.id::text, pf.submitted_at, p.full_name, 'parent',
+        'Submitted feedback for counsellor review', 'PARENT_FEEDBACK'
+      FROM parent_feedback pf
+      JOIN parents p ON p.id = pf.parent_id
+      WHERE pf.organization_id = $1
+
+      UNION ALL
+
+      SELECT pif.id::text, COALESCE(pif.submitted_at, pif.updated_at), p.full_name, 'parent',
+        CASE WHEN pif.status = 'submitted' THEN 'Submitted parent information form'
+          ELSE 'Saved parent information form draft' END,
+        'PARENT_FORM'
+      FROM parent_information_forms pif
+      JOIN parents p ON p.id = pif.parent_id
+      WHERE pif.organization_id = $1
+
+      UNION ALL
+
+      SELECT sm.id::text, sm.uploaded_at, s.full_name, 'student',
+        'Uploaded academic marksheet', 'MARKSHEET'
+      FROM student_marksheets sm
+      JOIN students s ON s.id = sm.student_id
+      WHERE sm.organization_id = $1
+
+      UNION ALL
+
+      SELECT ar.id::text, ar.completed_at, s.full_name, 'student',
+        'Submitted AI CMT assessment result', 'AI_CMT'
+      FROM student_ai_cmt_results ar
+      JOIN students s ON s.id = ar.student_id
+      WHERE ar.organization_id = $1
+    )
+    SELECT id,
+      TO_CHAR(created_at, 'HH24:MI') AS time,
+      TO_CHAR(created_at, 'DD Mon YYYY') AS date,
+      actor, role, action, reference, created_at
+    FROM activity
+    ORDER BY created_at DESC
     LIMIT 100
   `, [orgId]);
 
   const { rows: [counts] } = await query<any>(`
+    WITH portal_activity AS (
+      SELECT (
+        (SELECT COUNT(*) FROM daily_check_ins WHERE organization_id = $1) +
+        (SELECT COUNT(*) FROM parent_feedback WHERE organization_id = $1) +
+        (SELECT COUNT(*) FROM parent_information_forms WHERE organization_id = $1) +
+        (SELECT COUNT(*) FROM student_marksheets WHERE organization_id = $1) +
+        (SELECT COUNT(*) FROM student_ai_cmt_results WHERE organization_id = $1)
+      )::int AS total
+    )
     SELECT
-      COUNT(*)::int AS total,
+      (COUNT(*) + (SELECT total FROM portal_activity))::int AS total,
       COUNT(*) FILTER (WHERE actor_role_code = 'counsellor')::int AS counsellor,
       COUNT(*) FILTER (WHERE actor_role_code IN ('superadmin', 'brain_admin', 'admin') OR actor_role_code IS NULL)::int AS admin,
-      COUNT(*) FILTER (WHERE actor_role_code IN ('student', 'parent'))::int AS student_parent
+      (COUNT(*) FILTER (WHERE actor_role_code IN ('student', 'parent')) + (SELECT total FROM portal_activity))::int AS student_parent
     FROM audit_logs
     WHERE organization_id = $1 OR organization_id IS NULL
   `, [orgId]);

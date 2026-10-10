@@ -9,16 +9,6 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import env from '../config/env';
 
-const CARD_PRICES: Record<string, number> = {
-  ankur: 1499,
-  palavi: 1999,
-  lakshya: 2499,
-  disha: 2999,
-  udaan: 2999,
-  phoenix: 3999,
-  cmt: 1271,
-};
-
 function razorpayClient() {
   if (!env.razorpay.keyId || !env.razorpay.keySecret) {
     throw ApiError.internal('Razorpay Test Mode keys are not configured');
@@ -81,15 +71,47 @@ const CreateOrderSchema = z.object({
   slotTime: z.string().optional().nullable(),
 });
 
+paymentRoutes.get('/pricing/:code', requireAuth(), asyncHandler(async (req, res) => {
+  const code = String(req.params.code || '').toLowerCase();
+  if (!['ankur', 'palavi', 'lakshya', 'disha', 'udaan', 'phoenix', 'cmt'].includes(code)) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Unknown counselling product.');
+  }
+  const { rows: [program] } = await query<any>(`
+    SELECT code, name, price, gst_rate_percent
+    FROM programs
+    WHERE organization_id=$1 AND LOWER(code)=$2 AND is_active=TRUE
+    LIMIT 1
+  `, [req.auth!.orgId, code]);
+  if (!program) throw ApiError.notFound('Counselling product pricing not found.');
+  const price = Number(program.price);
+  const gstRatePercent = Number(program.gst_rate_percent || 0);
+  res.json(success({
+    code: program.code,
+    name: program.name,
+    price,
+    gstRatePercent,
+    totalWithGst: Math.round(price * (1 + gstRatePercent / 100)),
+  }));
+}));
+
 paymentRoutes.post('/razorpay/create-order', requireAuth(), validate(CreateOrderSchema), asyncHandler(async (req, res) => {
   const d = req.body;
   const auth = req.auth;
   const orgId = auth?.orgId || '00000000-0000-0000-0000-000000000001';
   const userId = auth?.userId || null;
 
-  const isCmt = d.programCode === 'cmt';
-  const programFee = isCmt ? 1271 : (CARD_PRICES[d.programCode] || 2499);
-  const gst = isCmt ? 229 : Math.round(programFee * 0.18);
+  const { rows: [program] } = await query<any>(`
+    SELECT id, price, gst_rate_percent, service_fee_rate_percent
+    FROM programs
+    WHERE organization_id=$2 AND LOWER(code)=LOWER($1) AND is_active=TRUE
+    LIMIT 1
+  `, [d.programCode, orgId]);
+  if (!program) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'The selected counselling product is not configured.');
+  }
+
+  const programFee = Number(program.price);
+  const gst = Math.round(programFee * Number(program.gst_rate_percent || 0) / 100);
   const grandTotal = programFee + gst;
   const amountInPaise = grandTotal * 100;
   const receiptNo = 'RCP-' + Date.now().toString().slice(-10);
@@ -150,17 +172,6 @@ paymentRoutes.post('/razorpay/create-order', requireAuth(), validate(CreateOrder
         `, [userId]);
         if (studentRows[0]) student = studentRows[0];
       }
-    }
-
-    const { rows: [program] } = await client.query<any>(
-      `SELECT id FROM programs
-       WHERE organization_id=$2 AND LOWER(code)=LOWER($1) AND is_active=TRUE
-       LIMIT 1`,
-      [d.programCode, orgId]
-    );
-
-    if (!program) {
-      throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'The selected counselling module is not configured.');
     }
 
     // Resolve target counsellor (user selected or fallback to active primary counsellor)

@@ -3,12 +3,18 @@ import env from './env';
 import fs from 'fs';
 import path from 'path';
 
+const dbUrl = process.env.SUPABASE_DATABASE_URL || process.env.DATABASE_URL;
+const sslCaPath = process.env.POSTGRES_SSL_CA_PATH
+  ? path.resolve(__dirname, '..', '..', process.env.POSTGRES_SSL_CA_PATH)
+  : null;
+const hasSslCa = Boolean(sslCaPath && fs.existsSync(sslCaPath));
+
 const pool = new Pool({
-  ...(process.env.SUPABASE_DATABASE_URL ? {
-    connectionString: process.env.SUPABASE_DATABASE_URL,
+  ...(dbUrl ? {
+    connectionString: dbUrl,
     ssl: {
-      rejectUnauthorized: true,
-      ...(process.env.POSTGRES_SSL_CA_PATH ? { ca: fs.readFileSync(path.resolve(__dirname, '..', '..', process.env.POSTGRES_SSL_CA_PATH), 'utf8') } : {}),
+      rejectUnauthorized: hasSslCa,
+      ...(hasSslCa && sslCaPath ? { ca: fs.readFileSync(sslCaPath, 'utf8') } : {}),
     },
   } : {
     host: env.db.host,
@@ -19,7 +25,7 @@ const pool = new Pool({
   }),
   max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: process.env.SUPABASE_DATABASE_URL ? 15000 : 2000,
+  connectionTimeoutMillis: dbUrl ? 15000 : 5000,
 });
 
 pool.on('error', (err) => {
@@ -27,20 +33,9 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-pool.on('connect', () => {
-  if (env.NODE_ENV !== 'production') {
-    console.debug('[DB] New client connection acquired');
-  }
-});
-
 export async function query<T = any>(text: string, params?: any[]): Promise<{ rows: T[]; rowCount: number }> {
-  const start = Date.now();
   try {
     const res = await pool.query(text, params);
-    if (env.NODE_ENV !== 'production') {
-      const duration = Date.now() - start;
-      console.debug(`[DB] ${duration}ms | ${res.rowCount} rows | ${text.slice(0, 120).replace(/\s+/g, ' ')}`);
-    }
     return { rows: res.rows as T[], rowCount: res.rowCount || 0 };
   } catch (err: any) {
     console.error(`[DB] Query failed: ${err.message}`);
@@ -67,10 +62,7 @@ export async function tx<T>(fn: (client: import('pg').PoolClient) => Promise<T>)
 
 export async function testConnection(): Promise<void> {
   try {
-    const { rows } = await query('SELECT NOW() AS now');
-    const target = process.env.SUPABASE_DATABASE_URL ? new URL(process.env.SUPABASE_DATABASE_URL) : undefined;
-    console.log(`✅ Database connected: ${target ? `${target.hostname}:${target.port || '5432'}${target.pathname}` : `${env.db.host}:${env.db.port}/${env.db.database}`}`);
-    console.log(`   Server time: ${rows[0].now}`);
+    await query('SELECT NOW() AS now');
   } catch (err: any) {
     console.error(`❌ Database connection failed: ${err.message}`);
     throw err;

@@ -8,6 +8,20 @@ import { query, tx } from '../config/db';
 
 import { hashPassword } from '../utils/auth';
 
+const DEFAULT_COUNSELLING_SLOTS = [
+  { startTime: '09:00:00', endTime: '10:00:00', display: '09:00 AM – 10:00 AM' },
+  { startTime: '11:00:00', endTime: '12:00:00', display: '11:00 AM – 12:00 PM' },
+  { startTime: '14:00:00', endTime: '15:00:00', display: '02:00 PM – 03:00 PM' },
+  { startTime: '16:00:00', endTime: '17:00:00', display: '04:00 PM – 05:00 PM' },
+  { startTime: '17:00:00', endTime: '18:00:00', display: '05:00 PM – 06:00 PM' },
+] as const;
+
+const timeLabel = (value: string) => {
+  const [hours, minutes] = value.split(':').map(Number);
+  const suffix = hours >= 12 ? 'PM' : 'AM';
+  return `${String(hours % 12 || 12).padStart(2, '0')}:${String(minutes).padStart(2, '0')} ${suffix}`;
+};
+
 appointmentRoutes.get('/', asyncHandler(async (_req, res) => {
   const { rows } = await query<any>(`
     SELECT c.id, c.user_id, c.full_name, c.title, c.specializations,
@@ -175,29 +189,51 @@ appointmentRoutes.delete('/:id', requireAuth(), asyncHandler(async (req, res) =>
 appointmentRoutes.get('/:id/availability', asyncHandler(async (req, res) => {
   const date = req.query.date as string || new Date().toISOString().slice(0, 10);
   const counsellorId = req.params.id;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Invalid availability date', { field: 'date' });
+  }
+  const isoDay = new Date(`${date}T00:00:00Z`).getUTCDay() || 7;
   const { rows: slots } = await query<any>(`
-    SELECT ts.id, ts.slot_start_time, ts.slot_end_time, ts.slot_time_display, ts.sort_order
+    SELECT ts.id, ts.slot_start_time, ts.slot_end_time, ts.slot_time_display, ts.sort_order,
+      ts.is_weekday_available
     FROM time_slots ts
+    JOIN counsellors c ON c.id=$1 AND c.is_active=TRUE AND c.deleted_at IS NULL
     WHERE ts.is_active = TRUE
+      AND (ts.branch_id=c.branch_id OR ts.branch_id IS NULL)
     ORDER BY ts.sort_order
-  `);
+  `, [counsellorId]);
   const { rows: bookings } = await query<any>(`
     SELECT a.slot_start_time, a.slot_end_time
     FROM appointments a
     WHERE a.counsellor_id = $1 AND a.appointment_date = $2::DATE
       AND a.status != 'cancelled'
   `, [counsellorId, date]);
-  const bookedStartTimes = new Set(bookings.map(b => String(b.slot_start_time)));
+  const bookedStartTimes = new Set(bookings.map(b => String(b.slot_start_time).slice(0, 8)));
+  const effectiveSlots = slots.length > 0
+    ? slots.filter(s => Boolean(s.is_weekday_available?.[isoDay - 1])).map(s => ({
+        id: s.id,
+        slot_start_time: String(s.slot_start_time),
+        slot_end_time: String(s.slot_end_time),
+        slot_time_display: s.slot_time_display,
+      }))
+    : isoDay <= 6
+      ? DEFAULT_COUNSELLING_SLOTS.map((slot) => ({
+          id: null,
+          slot_start_time: slot.startTime,
+          slot_end_time: slot.endTime,
+          slot_time_display: slot.display,
+        }))
+      : [];
 
   res.json(success({
     date,
     counsellorId,
-    slots: slots.map(s => ({
+    slots: effectiveSlots.map(s => ({
       timeSlotId: s.id,
-      startTime: s.slot_time_display.split('–')[0].trim(),
-      endTime: s.slot_time_display.split('–')[1]?.trim() || '',
+      startTime: timeLabel(s.slot_start_time),
+      endTime: timeLabel(s.slot_end_time),
       timeRangeDisplay: s.slot_time_display,
-      isBooked: bookedStartTimes.has(String(s.slot_start_time)),
+      isBooked: bookedStartTimes.has(String(s.slot_start_time).slice(0, 8)),
       slotStartTime: s.slot_start_time,
       slotEndTime: s.slot_end_time,
     })),
@@ -260,13 +296,23 @@ appointmentRoutes.post('/quick-book', requireAuth(), validate(QuickBookSchema), 
     `, [d.counsellorId, auth.orgId]);
     if (!counsellor) throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Selected counsellor is unavailable', { field: 'counsellorId' });
 
-    const { rows: [timeSlot] } = await client.query<any>(`
+    const { rows: [configuredTimeSlot] } = await client.query<any>(`
       SELECT id, slot_start_time, slot_end_time, slot_time_display
       FROM time_slots
       WHERE is_active = TRUE
         AND (slot_time_display = $1 OR UPPER(TO_CHAR(slot_start_time, 'HH12:MI AM')) = UPPER($1))
       LIMIT 1
     `, [d.timeDisplay]);
+    const defaultTimeSlot = DEFAULT_COUNSELLING_SLOTS.find((slot) =>
+      slot.display.toUpperCase() === d.timeDisplay.toUpperCase()
+      || timeLabel(slot.startTime).toUpperCase() === d.timeDisplay.toUpperCase()
+    );
+    const timeSlot = configuredTimeSlot || (defaultTimeSlot ? {
+      id: null,
+      slot_start_time: defaultTimeSlot.startTime,
+      slot_end_time: defaultTimeSlot.endTime,
+      slot_time_display: defaultTimeSlot.display,
+    } : null);
     if (!timeSlot) throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Selected time slot is unavailable', { field: 'timeDisplay' });
 
     const { rows: [duplicate] } = await client.query<any>(`

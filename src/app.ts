@@ -12,11 +12,30 @@ app.set('trust proxy', true);
 
 app.use(requestId);
 
+const configuredOrigins = env.cors.origin.split(',').map(s => s.trim()).filter(Boolean);
+
 app.use(cors({
-  origin: env.cors.origin.split(',').map(s => s.trim()).filter(Boolean),
+  origin: (origin, callback) => {
+    // Allow non-browser requests or same-origin requests with no Origin header
+    if (!origin) return callback(null, true);
+    if (configuredOrigins.includes(origin)) return callback(null, true);
+    try {
+      const parsed = new URL(origin);
+      if (parsed.hostname.endsWith('brainconsultancy.in') || parsed.hostname.endsWith('vercel.app')) {
+        return callback(null, true);
+      }
+    } catch { /* ignore URL parse error */ }
+    // In development or if localhost is explicitly permitted, allow any localhost/127.0.0.1 port
+    if (env.NODE_ENV !== 'production' || configuredOrigins.some(o => o.includes('localhost'))) {
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        return callback(null, true);
+      }
+    }
+    return callback(null, false);
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Org-Id', 'X-Request-Id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Org-Id', 'X-Request-Id', 'X-File-Type', 'X-File-Name', 'X-AICMT-Metrics', 'Accept'],
 }));
 
 app.use(express.json({

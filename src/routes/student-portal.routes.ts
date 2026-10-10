@@ -317,6 +317,13 @@ studentPortalRoutes.get('/:id/snapshot', asyncHandler(async (req, res) => {
     SELECT id, file_name AS name, mime_type AS "mimeType", file_size AS size, uploaded_at AS "uploadedAt"
     FROM student_marksheets WHERE student_id=$1 ORDER BY uploaded_at DESC
   `, [req.params.id]);
+  const { rows: [aiCmtResult] } = await query<any>(`
+    SELECT id, file_name AS "fileName", file_size AS "fileSize", metrics,
+      completed_at AS "completedAt", updated_at AS "updatedAt"
+    FROM student_ai_cmt_results
+    WHERE student_id=$1 AND organization_id=$2
+    ORDER BY completed_at DESC LIMIT 1
+  `, [req.params.id, req.auth!.orgId]);
   const { rows: [counsellorFeedback] } = await query<any>(`
     SELECT f.feedback_text AS text, f.feedback_date AS date, c.full_name AS "counsellorName"
     FROM student_progress_feedback f JOIN counsellors c ON c.id=f.counsellor_id
@@ -366,11 +373,69 @@ studentPortalRoutes.get('/:id/snapshot', asyncHandler(async (req, res) => {
     ORDER BY updated_at DESC LIMIT 1
   `, [req.params.id, req.auth!.userId, req.auth!.orgId]) : { rows: [null] };
   res.json(success({ actions, checkin: checkin || null, marksheets,
+    aiCmtResult: aiCmtResult || null,
     counsellorFeedback: counsellorFeedback || null,
     publishedAdvice: publishedAdvice || null,
     progressRating: progressRating || null,
     parentFeedback: parentFeedback || null,
     privateNote: privateNote || null }));
+}));
+
+studentPortalRoutes.post('/:id/ai-cmt-result', raw({ type: 'application/pdf', limit: '12mb' }), asyncHandler(async (req, res) => {
+  const { actor } = await access(req, String(req.params.id));
+  if (actor !== 'student') throw new ApiError('AUTH_ROLE_INSUFFICIENT', 'Only the student can submit an AI CMT result', 403);
+  const isPdfUpload = Buffer.isBuffer(req.body);
+  const bytes = isPdfUpload ? req.body as Buffer : Buffer.alloc(0);
+  const fileName = isPdfUpload
+    ? decodeURIComponent(String(req.headers['x-file-name'] || 'AI-CMT-result.pdf')).slice(0, 200)
+    : 'AI-CMT-assessment';
+  const mimeType = isPdfUpload ? 'application/pdf' : 'application/json';
+  if (isPdfUpload && (!bytes.length || bytes.length > 12 * 1024 * 1024 || bytes.subarray(0, 5).toString('ascii') !== '%PDF-')) {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'Upload a valid AI CMT PDF under 12 MB');
+  }
+  let metrics: Record<string, unknown> = {};
+  try {
+    if (isPdfUpload) {
+      const encodedMetrics = String(req.headers['x-aicmt-metrics'] || '');
+      metrics = encodedMetrics ? JSON.parse(decodeURIComponent(encodedMetrics)) : {};
+    } else {
+      metrics = req.body?.metrics && typeof req.body.metrics === 'object' ? req.body.metrics : {};
+    }
+  } catch {
+    throw ApiError.badRequest('INPUT_VALIDATION_FAILED', 'AI CMT metrics are invalid');
+  }
+  const cleanMetrics = Object.fromEntries(Object.entries(metrics).slice(0, 30).map(([key, value]) => [
+    key.slice(0, 80),
+    typeof value === 'string' ? value.slice(0, 500) : value,
+  ]));
+  const { rows: [result] } = await query<any>(`
+    INSERT INTO student_ai_cmt_results
+      (organization_id, student_id, file_name, mime_type, file_size, file_data, metrics, completed_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,NOW())
+    ON CONFLICT (student_id) DO UPDATE SET
+      organization_id=EXCLUDED.organization_id, file_name=EXCLUDED.file_name,
+      mime_type=EXCLUDED.mime_type, file_size=EXCLUDED.file_size, file_data=EXCLUDED.file_data,
+      metrics=EXCLUDED.metrics, completed_at=NOW(), updated_at=NOW()
+    RETURNING id, file_name AS "fileName", file_size AS "fileSize", metrics,
+      completed_at AS "completedAt", updated_at AS "updatedAt"
+  `, [req.auth!.orgId, req.params.id, fileName, mimeType, bytes.length, bytes, JSON.stringify(cleanMetrics)]);
+  res.status(201).json(success(result));
+}));
+
+studentPortalRoutes.get('/:id/ai-cmt-result/pdf', asyncHandler(async (req, res) => {
+  await access(req, String(req.params.id));
+  const { rows: [result] } = await query<any>(`
+    SELECT file_name, file_data, mime_type FROM student_ai_cmt_results
+    WHERE student_id=$1 AND organization_id=$2
+  `, [req.params.id, req.auth!.orgId]);
+  if (!result) throw ApiError.notFound('AI CMT result not found');
+  if (result.mime_type !== 'application/pdf' || !result.file_data?.length) {
+    throw ApiError.notFound('No generated PDF is stored for this assessment');
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${result.file_name.replace(/["\\\r\n]/g, '_')}"`);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.send(result.file_data);
 }));
 
 studentPortalRoutes.post('/:id/counsellor-note', validate(z.object({ text: z.string().trim().min(1).max(5000) })), asyncHandler(async (req, res) => {
